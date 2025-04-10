@@ -1,0 +1,29 @@
+/* API Note Importer Plugin Styles */
+
+/* Settings tab styles */
+/* Ensure textareas in settings have a minimum height and monospace font */
+.setting-item-control textarea {
+    min-height: 100px; /* Minimum height */
+    font-family: var(--font-monospace); /* Use Obsidian's monospace font variable */
+    width: 100%; /* Take full width */
+    resize: vertical; /* Allow only vertical resizing */
+}
+
+/* Specific styling for the body template textarea */
+.api-note-importer-body-template {
+    min-height: 150px; /* Give the body template a larger minimum height */
+}
+
+.api-note-importer-settings .setting-item-description {
+    margin-bottom: 8px;
+}
+
+/* Notification styles */
+.api-note-importer-notification {
+    display: flex;
+    align-items: center;
+}
+
+.api-note-importer-notification .icon {
+    margin-right: 8px;
+}
