@@ -1,4 +1,4 @@
-import { TFile, TFolder, Vault, MetadataCache } from 'obsidian';
+import { TFile, TFolder, Vault, MetadataCache, normalizePath } from 'obsidian';
 import { APINoteImporterSettings } from './settings';
 import { applyTemplate } from './templating';
 
@@ -51,48 +51,65 @@ export async function createNotesFromData(
  * @param metadataCache The Obsidian metadata cache
  */
 async function processDataItem(
-    item: any, 
-    settings: APINoteImporterSettings, 
-    vault: Vault, 
+    item: any,
+    settings: APINoteImporterSettings,
+    vault: Vault,
     metadataCache: MetadataCache
 ): Promise<void> {
+    let filePath = ''; // Define filePath in a broader scope for error logging
+    const uniqueId = item[settings.uniqueIdField];
+
     try {
         // Extract the unique ID from the data item
-        const uniqueId = item[settings.uniqueIdField];
-        
         if (uniqueId === undefined || uniqueId === null) {
-            console.warn(`Unique ID field "${settings.uniqueIdField}" not found in data item:`, item);
-            return;
+            console.warn(`Unique ID field "${settings.uniqueIdField}" not found or null in data item:`, item);
+            return; // Skip item if unique ID is missing
         }
-        
+
         // Check for duplicates if enabled
         if (settings.skipDuplicates) {
             const isDuplicate = await checkForDuplicate(uniqueId, settings, vault, metadataCache);
-            
             if (isDuplicate) {
-                console.log(`Skipping duplicate item with ID: ${uniqueId}`);
-                return;
+                // Log is now inside checkForDuplicate
+                return; // Skip duplicate
             }
         }
-        
+
         // Apply templates to create note title and body
         const noteTitle = applyTemplate(settings.noteTitleTemplate, item);
         const noteBody = applyTemplate(settings.noteBodyTemplate, item);
-        
+
         // Sanitize the title for use as a filename
         const sanitizedTitle = sanitizeFilename(noteTitle);
-        
-        // Construct the full file path
-        const folderPath = settings.targetFolderPath.endsWith('/') 
-            ? settings.targetFolderPath 
-            : settings.targetFolderPath + '/';
-        const filePath = `${folderPath}${sanitizedTitle}.md`;
-        
+
+        // Add Check for valid filename
+        if (!sanitizedTitle) {
+             console.warn(`Skipping item with ID ${uniqueId} due to invalid or empty filename after sanitization from title: "${noteTitle}"`);
+             return;
+        }
+
+        // Construct the full file path using normalizePath
+        const normalizedFolderPath = settings.targetFolderPath ? normalizePath(settings.targetFolderPath) : '';
+        filePath = normalizedFolderPath
+            ? `${normalizedFolderPath}/${sanitizedTitle}.md`
+            : `${sanitizedTitle}.md`; // Handle root vault case
+
+        // Ensure the target folder exists (moved here to avoid redundant checks in loop)
+        // Note: ensureFolder is called once before the loop now.
+
         // Create the note
         await vault.create(filePath, noteBody);
-        console.log(`Created note: ${filePath}`);
+        console.log(`Created note: ${filePath}`); // Log line matches 206
+
     } catch (error) {
-        console.error('Error processing data item:', error);
+        // Provide more specific error logging
+        if (error.message?.includes("File already exists")) {
+             console.error(`Error processing data item with ID ${uniqueId}: File "${filePath}" already exists. This likely indicates a duplicate check failure or filename collision.`);
+        } else {
+             console.error(`Error processing data item with ID ${uniqueId} at path "${filePath}":`, error);
+        }
+        // Log the item that caused the error for debugging
+        console.error("Data item causing error:", item);
     }
 }
 
@@ -106,36 +123,47 @@ async function processDataItem(
  * @returns True if a duplicate exists, false otherwise
  */
 async function checkForDuplicate(
-    uniqueId: any, 
-    settings: APINoteImporterSettings, 
-    vault: Vault, 
+    uniqueId: any,
+    settings: APINoteImporterSettings,
+    vault: Vault,
     metadataCache: MetadataCache
 ): Promise<boolean> {
-    // Get all markdown files in the target folder
-    const folder = vault.getAbstractFileByPath(settings.targetFolderPath);
-    
-    if (!folder || !(folder instanceof TFolder)) {
+    const normalizedFolderPath = settings.targetFolderPath ? normalizePath(settings.targetFolderPath) : '';
+    const targetFolder = vault.getAbstractFileByPath(normalizedFolderPath);
+
+    // If the target folder doesn't exist, no duplicates are possible yet.
+    if (!(targetFolder instanceof TFolder)) {
+        // This case is fine, folder will be created later if needed.
+        // console.log(`Duplicate check: Target folder "${normalizedFolderPath}" not found.`);
         return false;
     }
-    
-    const files = folder.children.filter((file: any) => file instanceof TFile && file.extension === 'md');
-    
-    // Check each file's frontmatter for the unique ID
-    for (const file of files) {
-        if (!(file instanceof TFile)) continue;
-        
-        const metadata = metadataCache.getFileCache(file);
-        
-        if (metadata && metadata.frontmatter) {
-            const frontmatterValue = metadata.frontmatter[settings.duplicateCheckFrontmatterKey];
-            
-            if (frontmatterValue !== undefined && String(frontmatterValue) === String(uniqueId)) {
-                return true;
+
+    // Iterate through files in the folder
+    for (const file of targetFolder.children) {
+        // Ensure it's a Markdown TFile
+        if (!(file instanceof TFile) || file.extension !== 'md') {
+            continue;
+        }
+
+        // Get file cache - use await for potentially async operations in future?
+        // For now, getFileCache is synchronous.
+        const fileCache = metadataCache.getFileCache(file);
+
+        // Check frontmatter if cache and frontmatter exist
+        if (fileCache?.frontmatter) {
+            const frontmatterValue = fileCache.frontmatter[settings.duplicateCheckFrontmatterKey];
+
+            // Check if the configured key exists and compare its value (as string)
+            if (frontmatterValue !== undefined && frontmatterValue !== null) {
+                if (String(frontmatterValue) === String(uniqueId)) {
+                    console.log(`Skipping duplicate item with ID: ${uniqueId} (Found in: "${file.path}")`); // Log line matches 196
+                    return true; // Duplicate found
+                }
             }
         }
     }
-    
-    return false;
+
+    return false; // No duplicate found in the target folder
 }
 
 /**
@@ -145,33 +173,30 @@ async function checkForDuplicate(
  * @param folderPath The path of the folder to ensure
  */
 async function ensureFolder(vault: Vault, folderPath: string): Promise<void> {
-    if (!folderPath || folderPath === '/') {
-        return;
+    // Normalize path and check if it's empty or root
+    const normalizedPath = normalizePath(folderPath);
+    if (!normalizedPath || normalizedPath === '/') {
+        return; // No need to create root
     }
-    
-    const folderExists = vault.getAbstractFileByPath(folderPath) instanceof TFolder;
-    
-    if (!folderExists) {
-        try {
-            // Split the path into segments and create each folder level
-            const pathSegments = folderPath.split('/').filter(segment => segment.length > 0);
-            let currentPath = '';
-            
-            for (const segment of pathSegments) {
-                currentPath += segment;
-                
-                if (!vault.getAbstractFileByPath(currentPath)) {
-                    await vault.createFolder(currentPath);
-                }
-                
-                currentPath += '/';
-            }
-            
-            console.log(`Created folder: ${folderPath}`);
-        } catch (error) {
-            console.error(`Error creating folder ${folderPath}:`, error);
-            throw error;
+
+    try {
+        // Check if folder exists
+        const folder = vault.getAbstractFileByPath(normalizedPath);
+
+        if (!folder) {
+            // Folder doesn't exist, create it recursively
+            await vault.createFolder(normalizedPath);
+            console.log(`Created folder: ${normalizedPath}`); // Log line matches 246
+        } else if (!(folder instanceof TFolder)) {
+            // Path exists but is not a folder
+            console.error(`Error: Path "${normalizedPath}" exists but is not a folder.`);
+            throw new Error(`Path "${normalizedPath}" exists but is not a folder.`);
         }
+        // Folder exists, do nothing
+    } catch (error) {
+        console.error(`Error ensuring folder "${normalizedPath}" exists:`, error);
+        // Re-throw or handle as needed, maybe prevent note creation if folder fails
+        throw error;
     }
 }
 
